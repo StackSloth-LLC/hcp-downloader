@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pipenv install)",
+      "Bash(pip install:*)",
+      "Bash(pip3 install:*)",
+      "Bash(uv:*)"
+    ]
+  }
+}
