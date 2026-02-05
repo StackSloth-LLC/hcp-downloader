@@ -10,6 +10,7 @@ import argparse
 import shutil
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import requests
@@ -23,52 +24,117 @@ class IncompleteDownloadError(Exception):
     pass
 
 
-def authenticate(url: str, sharing_id: str, password: str) -> dict[str, str]:
+def authenticate(link: str, password: str, headless: bool = True) -> tuple[str, str, dict[str, str]]:
     """
-    Use Playwright to authenticate with the gofile sharing URL.
+    Use Playwright to authenticate with a gofile.me sharing URL.
+
+    Navigates to the gofile.me link, waits for redirect to quickconnect.to,
+    then authenticates with the password.
 
     Args:
-        url: Base gofile URL (e.g., https://gofile-xxx.quickconnect.to)
-        sharing_id: The sharing ID from URL path
+        link: gofile.me sharing URL (e.g., https://gofile.me/7g4WA/ZRnqeWks3)
         password: Password for the shared folder
+        headless: Run browser in headless mode (default: True)
 
     Returns:
-        Dictionary containing cookies (type, sharing_sid)
+        Tuple of (base_url, sharing_id, cookies_dict)
     """
-    full_url = f"{url}/sharing/{sharing_id}"
-    print(f"Authenticating at {full_url}...")
+    print(f"Navigating to {link}...")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=headless)
         context = browser.new_context()
         page = context.new_page()
 
-        # Navigate to the sharing URL
-        page.goto(full_url)
+        # Navigate to the gofile.me URL
+        page.goto(link)
+
+        # Wait for redirect to quickconnect.to
+        print("Waiting for redirect to quickconnect.to...")
+        page.wait_for_url(lambda url: "quickconnect.to" in url, timeout=60000)
+
+        # Extract base URL and sharing ID from the redirected URL
+        current_url = page.url
+        print(f"Redirected to: {current_url}")
+
+        parsed = urllib.parse.urlparse(current_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}"
+
+        # Extract sharing_id from path (e.g., /sharing/ZRnqeWks3)
+        path_parts = parsed.path.strip("/").split("/")
+        if len(path_parts) >= 2 and path_parts[0] == "sharing":
+            sharing_id = path_parts[1]
+        else:
+            raise RuntimeError(f"Could not extract sharing_id from URL: {current_url}")
+
+        print(f"Base URL: {base_url}")
+        print(f"Sharing ID: {sharing_id}")
 
         # Wait for the password form to appear
-        page.wait_for_selector('input[type="password"]', timeout=30000)
+        print("Waiting for password form...")
+        page.wait_for_selector('input[name="ext-comp-1025"]', timeout=30000)
 
+        print("Password form loaded.")
         # Enter password and submit
-        page.fill('input[type="password"]', password)
-        page.click('button[type="submit"]')
+        page.fill('input[name="ext-comp-1025"]', password)
+        page.press('input[name="ext-comp-1025"]', 'Enter')
 
         # Wait for authentication to complete - look for file list or folder content
         # The page should redirect or show content after successful auth
-        page.wait_for_selector(
-            '[class*="file"], [class*="folder"], [class*="list"], [class*="grid"]',
-            timeout=30000,
-        )
+#        page.wait_for_selector(
+#            '[class*="file"], [class*="folder"], [class*="list"], [class*="grid"]',
+#            timeout=30000,
+#        )
 
-        # Give it a moment for cookies to be set
-        time.sleep(1)
+        # Set up network request logging to capture API calls
+        api_requests = []
+        def log_request(request):
+            if "webapi" in request.url:
+                api_requests.append({
+                    "url": request.url,
+                    "method": request.method,
+                    "post_data": request.post_data,
+                })
+        page.on("request", log_request)
 
-        # Extract cookies
-        cookies = context.cookies()
+        # Poll for sharing_sid cookie for up to 30 seconds
+        print("Waiting for sharing_sid cookie...")
         cookie_dict = {}
-        for cookie in cookies:
-            if cookie["name"] in ("type", "sharing_sid"):
+        max_wait = 30
+        start_time = time.time()
+
+        while time.time() - start_time < max_wait:
+            cookies = context.cookies()
+            elapsed = time.time() - start_time
+            print(f"  [{elapsed:.1f}s] Found cookies: {[(c['name'], c['domain']) for c in cookies]}")
+
+            # Capture all cookies (not just specific ones)
+            for cookie in cookies:
                 cookie_dict[cookie["name"]] = cookie["value"]
+
+            if "sharing_sid" in cookie_dict:
+                print(f"  Got sharing_sid cookie after {elapsed:.1f}s")
+                # Wait for the file list to load (this triggers the real API call)
+                print("Waiting for file list to load...")
+                try:
+                    page.wait_for_selector('[class*="x-grid"], [class*="thumb"], .x-panel', timeout=15000)
+                    time.sleep(2)  # Give it time to complete API requests
+                except Exception:
+                    time.sleep(5)  # Fallback wait
+                break
+
+            time.sleep(0.5)
+        else:
+            print(f"  Timed out after {max_wait}s waiting for sharing_sid cookie")
+
+        # Print captured API requests
+        if api_requests:
+            print("\nCaptured API requests from browser:")
+            for req in api_requests:
+                print(f"  URL: {req['url']}")
+                print(f"  Method: {req['method']}")
+                print(f"  Post data: {req['post_data']}")
+                print()
 
         browser.close()
 
@@ -78,7 +144,8 @@ def authenticate(url: str, sharing_id: str, password: str) -> dict[str, str]:
         )
 
     print("Authentication successful!")
-    return cookie_dict
+    print(f"Captured cookies: {list(cookie_dict.keys())}")
+    return base_url, sharing_id, cookie_dict
 
 
 def make_api_request(
@@ -111,6 +178,7 @@ def list_contents(
 ) -> list[dict]:
     """
     List directory contents using the SYNO.FolderSharing.List API.
+    Handles pagination to fetch all items.
 
     Args:
         base_url: Base gofile URL
@@ -121,28 +189,50 @@ def list_contents(
     Returns:
         List of items with type (file/folder), name, size, etc.
     """
-    data = {
-        "api": "SYNO.FolderSharing.List",
-        "method": "list",
-        "version": "2",
-        "offset": "0",
-        "limit": "1000",
-        "sort_by": '"name"',
-        "sort_direction": '"ASC"',
-        "action": '"enum"',
-        "additional": '["size","owner","time","perm","type","mount_point_type"]',
-        "filetype": '"all"',
-        "folder_path": f'"{folder_path}"',
-        "_sharing_id": f'"{sharing_id}"',
-    }
+    all_items = []
+    offset = 0
+    limit = 1000
+    total = None
 
-    result = make_api_request(base_url, cookies, data)
+    while True:
+        data = {
+            "api": "SYNO.FolderSharing.List",
+            "method": "list",
+            "version": "2",
+            "offset": str(offset),
+            "limit": str(limit),
+            "sort_by": '"name"',
+            "sort_direction": '"ASC"',
+            "action": '"enum"',
+            "additional": '["size","owner","time","perm","type","mount_point_type"]',
+            "filetype": '"all"',
+            "folder_path": f'"{folder_path}"',
+            "_sharing_id": f'"{sharing_id}"',
+        }
 
-    if not result.get("success"):
-        error = result.get("error", {})
-        raise RuntimeError(f"API error listing {folder_path}: {error}")
+        result = make_api_request(base_url, cookies, data)
 
-    return result.get("data", {}).get("items", [])
+        if not result.get("success"):
+            error = result.get("error", {})
+            raise RuntimeError(f"API error listing {folder_path}: {error}")
+
+        data_obj = result.get("data", {})
+        items = data_obj.get("files", [])
+        total = data_obj.get("total", 0)
+
+        all_items.extend(items)
+
+        # Log progress for directories with many items
+        if total > limit:
+            print(f"  [{folder_path}] Fetched {len(all_items)}/{total} items...")
+
+        # Check if we have all items
+        if len(all_items) >= total or len(items) < limit:
+            break
+
+        offset += limit
+
+    return all_items
 
 
 def build_download_url(
@@ -208,20 +298,29 @@ def download_file(
     for attempt in range(max_retries):
         try:
             with requests.get(
-                download_url, cookies=cookies, stream=True, timeout=30
+                download_url, cookies=cookies, stream=True, timeout=(10, 300)
             ) as r:
                 r.raise_for_status()
 
                 content_length = int(r.headers.get("content-length", 0))
                 check_size = expected_size if expected_size > 0 else content_length
 
-                # Stream download with progress
+                # Stream download with progress bar showing speed
                 downloaded = 0
                 with open(temp_path, "wb") as f:
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
-                            f.write(chunk)
-                            downloaded += len(chunk)
+                    with tqdm(
+                        total=check_size,
+                        unit="B",
+                        unit_scale=True,
+                        unit_divisor=1024,
+                        desc=filename[:30],
+                        leave=False,
+                    ) as pbar:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                                downloaded += len(chunk)
+                                pbar.update(len(chunk))
 
                 # Verify size
                 if check_size > 0 and downloaded != check_size:
@@ -292,6 +391,7 @@ def crawl_and_download(
     root_path: str = "/",
     max_retries: int = 3,
     skip_existing: bool = False,
+    workers: int = 4,
 ) -> dict:
     """
     Recursively traverse directories and download all files.
@@ -304,6 +404,7 @@ def crawl_and_download(
         root_path: Starting path on the server
         max_retries: Maximum retry attempts per file
         skip_existing: Skip files that already exist locally
+        workers: Number of concurrent download threads
 
     Returns:
         Dictionary with counts: downloaded, failed, skipped
@@ -315,8 +416,10 @@ def crawl_and_download(
 
     def collect_files(current_path: str):
         """Recursively collect all files."""
+        print(f"Scanning: {current_path}")
         try:
             items = list_contents(base_url, cookies, sharing_id, current_path)
+            print(f"  Found {len(items)} items in {current_path}")
         except Exception as e:
             print(f"Error listing {current_path}: {e}")
             return
@@ -333,9 +436,11 @@ def crawl_and_download(
             if is_folder:
                 collect_files(item_path)
             else:
-                size = item.get("additional", {}).get("size", 0)
+                additional = item.get("additional", {})
+                size = additional.get("size", 0)
+                mtime = additional.get("time", {}).get("mtime", int(time.time()))
                 all_files.append(
-                    {"path": item_path, "name": name, "size": size}
+                    {"path": item_path, "name": name, "size": size, "mtime": mtime}
                 )
 
     print("Scanning directories...")
@@ -345,23 +450,37 @@ def crawl_and_download(
     if not all_files:
         return stats
 
-    # Download files with progress bar
-    for file_info in tqdm(all_files, desc="Downloading", unit="file"):
-        file_path = file_info["path"]
+    # Filter out files to skip
+    files_to_download = []
+    for file_info in all_files:
         filename = file_info["name"]
         size = file_info["size"]
-
-        # Handle filename collisions
-        output_path = get_unique_filename(output_dir, filename)
-
-        # Check if we should skip
         if skip_existing and (output_dir / filename).exists():
             existing_size = (output_dir / filename).stat().st_size
             if existing_size == size:
                 stats["skipped"] += 1
                 continue
+        files_to_download.append(file_info)
 
-        success = download_file(
+    if not files_to_download:
+        print(f"Skipped {stats['skipped']} existing files, nothing to download")
+        return stats
+
+    print(f"Downloading {len(files_to_download)} files with {workers} threads...")
+
+    def download_task(file_info):
+        """Download a single file (for thread pool)."""
+        file_path = file_info["path"]
+        filename = file_info["name"]
+        size = file_info["size"]
+        mtime = file_info["mtime"]
+
+        # Use epoch timestamp as filename, preserve extension
+        ext = Path(filename).suffix
+        epoch_filename = f"{mtime}{ext}"
+        output_path = get_unique_filename(output_dir, epoch_filename)
+
+        return download_file(
             base_url=base_url,
             cookies=cookies,
             sharing_id=sharing_id,
@@ -372,10 +491,16 @@ def crawl_and_download(
             max_retries=max_retries,
         )
 
-        if success:
-            stats["downloaded"] += 1
-        else:
-            stats["failed"] += 1
+    # Download files concurrently with progress bar
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(download_task, f): f for f in files_to_download}
+        with tqdm(total=len(files_to_download), desc="Downloading", unit="file") as pbar:
+            for future in as_completed(futures):
+                if future.result():
+                    stats["downloaded"] += 1
+                else:
+                    stats["failed"] += 1
+                pbar.update(1)
 
     return stats
 
@@ -387,20 +512,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Example usage:
-  %(prog)s --url https://gofile-xxx.quickconnect.to --sharing-id ZRnqeWks3 --password "yourpassword"
-  %(prog)s --url https://gofile-xxx.quickconnect.to --sharing-id ZRnqeWks3 --password "yourpassword" --output ./photos --skip-existing
+  %(prog)s --link https://gofile.me/7g4WA/ZRnqeWks3 --password "yourpassword"
+  %(prog)s --link https://gofile.me/7g4WA/ZRnqeWks3 --password "yourpassword" --output ./photos --skip-existing
         """,
     )
 
     parser.add_argument(
-        "--url",
+        "--link",
         required=True,
-        help="Base gofile URL (e.g., https://gofile-xxx.quickconnect.to)",
-    )
-    parser.add_argument(
-        "--sharing-id",
-        required=True,
-        help="The sharing ID from URL path (e.g., ZRnqeWks3)",
+        help="gofile.me sharing URL (e.g., https://gofile.me/7g4WA/ZRnqeWks3)",
     )
     parser.add_argument(
         "--password",
@@ -423,11 +543,24 @@ Example usage:
         action="store_true",
         help="Skip files that already exist locally with matching size",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show browser window during authentication (non-headless mode)",
+    )
+    parser.add_argument(
+        "--folder-path",
+        default="/",
+        help="Starting folder path on the server (default: /)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of concurrent download threads (default: 4)",
+    )
 
     args = parser.parse_args()
-
-    # Normalize URL (remove trailing slash)
-    base_url = args.url.rstrip("/")
 
     # Create output directory
     output_dir = Path(args.output)
@@ -435,9 +568,11 @@ Example usage:
 
     print(f"Output directory: {output_dir.absolute()}")
 
-    # Authenticate
+    # Authenticate (this also resolves the redirect and extracts base_url/sharing_id)
     try:
-        cookies = authenticate(base_url, args.sharing_id, args.password)
+        base_url, sharing_id, cookies = authenticate(
+            args.link, args.password, headless=not args.debug
+        )
     except Exception as e:
         print(f"Authentication failed: {e}")
         return 1
@@ -447,10 +582,12 @@ Example usage:
         stats = crawl_and_download(
             base_url=base_url,
             cookies=cookies,
-            sharing_id=args.sharing_id,
+            sharing_id=sharing_id,
             output_dir=output_dir,
+            root_path=args.folder_path,
             max_retries=args.retries,
             skip_existing=args.skip_existing,
+            workers=args.workers,
         )
     except Exception as e:
         print(f"Download failed: {e}")
