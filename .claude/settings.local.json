@@ -4,7 +4,13 @@
       "Bash(pipenv install)",
       "Bash(pip install:*)",
       "Bash(pip3 install:*)",
-      "Bash(uv:*)"
+      "Bash(uv:*)",
+      "Bash(exiftool:*)",
+      "WebSearch",
+      "WebFetch(domain:developer.adobe.com)",
+      "WebFetch(domain:exiftool.org)",
+      "WebFetch(domain:docs.photoprism.app)",
+      "WebFetch(domain:www.sritch.com)"
     ]
   }
 }
