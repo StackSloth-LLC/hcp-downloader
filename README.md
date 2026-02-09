@@ -140,6 +140,74 @@ uv run download.py \
 - A summary at the end shows downloaded, failed, skipped, and filtered counts
 - Failed downloads are logged to `<output_dir>/failed_downloads.log` (JSON lines format)
 
+## XMP Sidecar Generator
+
+`generate_xmp.py` extracts Camera Raw Settings from photographer-edited JPGs and generates `.xmp` sidecar files for CR3 RAW files. When the CR3 files are imported into Lightroom, the style is automatically applied.
+
+### How it works
+
+1. Reads all XMP Camera Raw Settings embedded in the JPGs using `exiftool`
+2. Classifies each setting as either a **style setting** (consistent across images) or a **per-image setting** (varies per shot, like exposure and white balance)
+3. Generates one `.xmp` sidecar file per CR3 file containing the extracted style
+
+### Requirements
+
+- [exiftool](https://exiftool.org/) must be installed and on your PATH
+
+### Usage
+
+```bash
+uv run generate_xmp.py --jpg-dir <JPG_DIR> [OPTIONS]
+```
+
+#### Required Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `--jpg-dir` | Directory containing photographer-edited JPGs with embedded XMP CRS data |
+
+#### Optional Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--cr3-dir` | `./downloads` | Directory containing CR3 RAW files |
+| `--analyze-only` | off | Extract and display style analysis without generating sidecars |
+| `--dry-run` | off | Show what would be generated without writing files |
+| `--skip-existing` | off | Skip CR3 files that already have an `.xmp` sidecar |
+| `--calibrate` | off | Match JPGs to CR3s by filename; matched get full edit, unmatched get nearest-neighbor style |
+
+### Examples
+
+#### Analyze the style without generating sidecars
+
+```bash
+uv run generate_xmp.py --jpg-dir ./sneak_peeks --analyze-only
+```
+
+#### Generate sidecars for all CR3 files
+
+```bash
+uv run generate_xmp.py --jpg-dir ./sneak_peeks --cr3-dir ./downloads
+```
+
+#### Calibration mode
+
+Calibration mode matches JPGs to CR3s by their `DateTimeOriginal` EXIF metadata — no renaming needed. Matched CR3s get the full per-image Camera Raw Settings from their paired JPG. Unmatched CR3s get a scene-appropriate style computed from the 5 nearest matched CR3s (based on EXIF shooting data: ISO, exposure time, aperture, focal length, and flash).
+
+```bash
+# Preview matching without generating sidecars
+uv run generate_xmp.py --jpg-dir ./sneak_peeks --cr3-dir ./downloads --calibrate --analyze-only
+
+# Generate calibrated sidecars
+uv run generate_xmp.py --jpg-dir ./sneak_peeks --cr3-dir ./downloads --calibrate
+```
+
+#### Dry run with skip existing
+
+```bash
+uv run generate_xmp.py --jpg-dir ./sneak_peeks --cr3-dir ./downloads --skip-existing --dry-run
+```
+
 ## How It Works
 
 1. Navigates to the gofile.me link using Playwright

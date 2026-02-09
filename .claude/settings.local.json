@@ -10,7 +10,8 @@
       "WebFetch(domain:developer.adobe.com)",
       "WebFetch(domain:exiftool.org)",
       "WebFetch(domain:docs.photoprism.app)",
-      "WebFetch(domain:www.sritch.com)"
+      "WebFetch(domain:www.sritch.com)",
+      "Bash(python3:*)"
     ]
   }
 }

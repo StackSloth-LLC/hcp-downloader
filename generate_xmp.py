@@ -8,13 +8,15 @@ Extracts Camera Raw Settings from photographer-edited JPGs and generates
 
 import argparse
 import json
-import subprocess
+import math
 import sys
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from statistics import median, stdev
 from textwrap import dedent
 
+import exiftool
 from tqdm import tqdm
 
 # Tags that are always per-image (never part of the style)
@@ -59,17 +61,16 @@ TONE_CURVE_TAGS = {
 }
 
 
-def extract_crs_from_jpgs(jpg_dir: Path) -> list[dict]:
+def extract_crs_from_jpgs(jpg_dir: Path, et: exiftool.ExifTool) -> tuple[list[dict], list[str]]:
     """
     Extract all XMP Camera Raw Settings from JPGs using exiftool.
 
-    Runs a single batch exiftool call and parses the JSON output.
-
     Args:
         jpg_dir: Directory containing photographer-edited JPGs
+        et: Running ExifTool instance
 
     Returns:
-        List of dicts, each mapping CRS tag name -> value for one JPG
+        Tuple of (list of CRS dicts, list of source filenames)
     """
     jpg_files = sorted(jpg_dir.glob("*.jpg")) + sorted(jpg_dir.glob("*.JPG"))
     if not jpg_files:
@@ -78,31 +79,80 @@ def extract_crs_from_jpgs(jpg_dir: Path) -> list[dict]:
 
     print(f"Found {len(jpg_files)} JPG files in {jpg_dir}")
 
-    result = subprocess.run(
-        ["exiftool", "-j", "-G1", "-XMP-crs:all"] + [str(f) for f in jpg_files],
-        capture_output=True,
-        text=True,
-    )
+    raw_entries = et.execute_json("-XMP-crs:all", *[str(f) for f in jpg_files])
 
-    if result.returncode != 0:
-        print(f"exiftool error: {result.stderr}")
-        sys.exit(1)
-
-    raw_entries = json.loads(result.stdout)
-
-    # Strip "XMP-crs:" prefix from tag names
+    # Strip "XMP:" prefix from tag names, track source filenames
     cleaned = []
+    source_files = []
     for entry in raw_entries:
         d = {}
         for key, value in entry.items():
-            if key.startswith("XMP-crs:"):
-                tag_name = key[len("XMP-crs:"):]
+            if key.startswith("XMP:"):
+                tag_name = key[len("XMP:"):]
                 d[tag_name] = value
         if d:
             cleaned.append(d)
+            source_files.append(entry.get("SourceFile", ""))
 
     print(f"Extracted CRS data from {len(cleaned)} files")
-    return cleaned
+    return cleaned, source_files
+
+
+def extract_cr3_metadata(
+    cr3_files: list[Path], workers: int = 4,
+) -> dict[str, dict]:
+    """
+    Extract timestamps and shooting EXIF from all CR3 files in one pass.
+
+    Runs multiple exiftool processes in parallel for speed.
+
+    Args:
+        cr3_files: List of CR3 file paths
+        workers: Number of parallel exiftool processes
+
+    Returns:
+        Dict mapping CR3 stem (lowercase) to metadata dict with keys:
+        datetime, ISO, ExposureTime, FNumber, FocalLength, Flash
+    """
+    if not cr3_files:
+        return {}
+
+    chunk_size = 50
+    file_strs = [str(f) for f in cr3_files]
+    chunks = [file_strs[i:i + chunk_size] for i in range(0, len(file_strs), chunk_size)]
+
+    def process_chunk(chunk: list[str]) -> dict[str, dict]:
+        result = {}
+        with exiftool.ExifTool() as et:
+            entries = et.execute_json(
+                "-n", "-DateTimeOriginal", "-SubSecTimeOriginal",
+                "-ISO", "-ExposureTime", "-FNumber", "-FocalLength", "-Flash",
+                *chunk,
+            )
+            for entry in entries:
+                source = entry.get("SourceFile", "")
+                stem = Path(source).stem.lower()
+                dt = entry.get("EXIF:DateTimeOriginal", "")
+                subsec = str(entry.get("EXIF:SubSecTimeOriginal", ""))
+                result[stem] = {
+                    "datetime": f"{dt}.{subsec}" if dt and subsec else dt,
+                    "ISO": entry.get("EXIF:ISO", 0),
+                    "ExposureTime": entry.get("EXIF:ExposureTime", 0),
+                    "FNumber": entry.get("EXIF:FNumber", 0),
+                    "FocalLength": entry.get("EXIF:FocalLength", 0),
+                    "Flash": 1 if entry.get("EXIF:Flash", 0) else 0,
+                }
+        return result
+
+    metadata = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(process_chunk, chunk): len(chunk) for chunk in chunks}
+        with tqdm(total=len(cr3_files), desc="  Reading metadata from CR3s", unit="file") as pbar:
+            for future in as_completed(futures):
+                metadata.update(future.result())
+                pbar.update(futures[future])
+
+    return metadata
 
 
 def classify_settings(all_crs: list[dict]) -> tuple[dict, list[dict]]:
@@ -231,20 +281,33 @@ def _pick_most_common_list(values: list[list]) -> list:
 
 def _classify_numeric(tag: str, values: list) -> tuple[str, object, str]:
     """Classify a numeric tag based on variance."""
-    # All identical
-    if len(set(values)) == 1:
-        return "style", values[0], "identical across all files"
+    # Coerce to float, dropping any non-numeric values
+    numeric = []
+    for v in values:
+        if isinstance(v, (int, float)):
+            numeric.append(float(v))
+        elif isinstance(v, str):
+            try:
+                numeric.append(float(v))
+            except ValueError:
+                continue
+    if not numeric:
+        return "per-image", None, "no numeric values after coercion"
 
-    med = median(values)
+    # All identical
+    if len(set(numeric)) == 1:
+        return "style", numeric[0], "identical across all files"
+
+    med = median(numeric)
     if med == 0:
         # Can't compute CV with zero median; check if values are close to zero
-        if all(abs(v) < 0.01 for v in values):
+        if all(abs(v) < 0.01 for v in numeric):
             return "style", 0, "all near zero"
         return "per-image", None, "varies (zero median, nonzero values)"
 
     # Coefficient of variation
     try:
-        sd = stdev(values)
+        sd = stdev(numeric)
         cv = (sd / abs(med)) * 100
     except Exception:
         return "per-image", None, "could not compute variance"
@@ -256,11 +319,17 @@ def _classify_numeric(tag: str, values: list) -> tuple[str, object, str]:
 
 def _classify_string(tag: str, values: list[str]) -> tuple[str, object, str]:
     """Classify a string tag based on agreement percentage."""
-    counter = Counter(values)
+    # Coerce all values to strings for consistent hashing
+    str_values = [str(v) for v in values]
+    counter = Counter(str_values)
     most_common_val, most_common_count = counter.most_common(1)[0]
-    agreement = most_common_count / len(values)
+    agreement = most_common_count / len(str_values)
 
     if agreement > 0.8:
+        # Return the original value matching the most common string
+        for v, s in zip(values, str_values):
+            if s == most_common_val:
+                return "style", v, f"{agreement:.0%} agreement"
         return "style", most_common_val, f"{agreement:.0%} agreement"
     return "per-image", None, f"only {agreement:.0%} agreement"
 
@@ -279,6 +348,244 @@ def _classify_list(tag: str, values: list[list]) -> tuple[str, object, str]:
                 return "style", v, f"{agreement:.0%} identical"
         return "style", values[0], f"{agreement:.0%} identical"
     return "per-image", None, f"only {agreement:.0%} identical"
+
+
+def _merge_crs(crs_list: list[dict]) -> dict:
+    """
+    Merge multiple CRS dicts into one.
+
+    - Numeric values: mean
+    - String values: most common
+    - List values: most common by JSON serialization
+    """
+    if not crs_list:
+        return {}
+    if len(crs_list) == 1:
+        return dict(crs_list[0])
+
+    all_tags = set()
+    for crs in crs_list:
+        all_tags.update(crs.keys())
+
+    merged = {}
+    for tag in all_tags:
+        values = [crs[tag] for crs in crs_list if tag in crs]
+        if not values:
+            continue
+
+        # Try to average as numeric; fall back to most-common if any value isn't a number
+        numeric = []
+        for v in values:
+            if isinstance(v, (int, float)):
+                numeric.append(float(v))
+            elif isinstance(v, str):
+                try:
+                    numeric.append(float(v))
+                except ValueError:
+                    break
+            else:
+                break
+
+        if len(numeric) == len(values):
+            merged[tag] = round(sum(numeric) / len(numeric), 4)
+        elif isinstance(values[0], list):
+            merged[tag] = _pick_most_common_list(values)
+        else:
+            # String or other: most common
+            counter = Counter(str(v) for v in values)
+            most_common_str = counter.most_common(1)[0][0]
+            for v in values:
+                if str(v) == most_common_str:
+                    merged[tag] = v
+                    break
+            else:
+                merged[tag] = values[0]
+
+    return merged
+
+
+def _extract_datetimes(
+    file_paths: list[str], label: str = "files", workers: int = 4,
+) -> dict[str, str]:
+    """
+    Extract DateTimeOriginal + SubSecTimeOriginal from files via exiftool.
+
+    Runs multiple exiftool processes in parallel for speed.
+
+    Returns:
+        Dict mapping file path -> composite datetime string
+    """
+    if not file_paths:
+        return {}
+
+    chunk_size = 50
+    chunks = [file_paths[i:i + chunk_size] for i in range(0, len(file_paths), chunk_size)]
+
+    def process_chunk(chunk: list[str]) -> dict[str, str]:
+        result = {}
+        with exiftool.ExifTool() as et:
+            entries = et.execute_json("-DateTimeOriginal", "-SubSecTimeOriginal", *chunk)
+            for entry in entries:
+                src = entry.get("SourceFile", "")
+                dt = entry.get("EXIF:DateTimeOriginal", "")
+                if dt:
+                    subsec = str(entry.get("EXIF:SubSecTimeOriginal", ""))
+                    result[src] = f"{dt}.{subsec}" if subsec else dt
+        return result
+
+    dt_map = {}
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(process_chunk, chunk): len(chunk) for chunk in chunks}
+        with tqdm(total=len(file_paths), desc=f"  Reading timestamps from {label}", unit="file") as pbar:
+            for future in as_completed(futures):
+                dt_map.update(future.result())
+                pbar.update(futures[future])
+
+    return dt_map
+
+
+def match_and_calibrate(
+    all_crs: list[dict],
+    source_files: list[str],
+    cr3_dir: Path,
+) -> dict[str, dict]:
+    """
+    Match JPGs to CR3s by DateTimeOriginal; matched CR3s get full CRS,
+    unmatched CR3s get nearest-neighbor averaged CRS from matched CR3s.
+
+    Args:
+        all_crs: List of CRS dicts from extract_crs_from_jpgs()
+        source_files: Parallel list of source filenames
+        cr3_dir: Directory containing CR3 files
+
+    Returns:
+        Dict mapping CR3 stem (lowercase) to CRS settings dict
+    """
+    # Get all CR3 files
+    cr3_files = sorted(cr3_dir.glob("*.CR3")) + sorted(cr3_dir.glob("*.cr3"))
+    all_cr3_stems = {f.stem.lower() for f in cr3_files}
+
+    # Single pass: extract timestamps + shooting EXIF from all CR3s
+    cr3_metadata = extract_cr3_metadata(cr3_files)
+
+    # Extract timestamps from JPGs (small set, fast)
+    jpg_datetimes = _extract_datetimes(source_files, label="JPGs")
+
+    # Build CR3 datetime -> stem lookup
+    cr3_dt_to_stem: dict[str, str] = {}
+    for stem, meta in cr3_metadata.items():
+        dt = meta.get("datetime", "")
+        if dt:
+            cr3_dt_to_stem[dt] = stem
+
+    # Match JPGs to CR3s by DateTimeOriginal
+    matched_stems: set[str] = set()
+    matched_jpgs: set[str] = set()
+    # jpg_by_stem stores matched CR3 stem -> CRS from its paired JPG
+    jpg_by_stem: dict[str, dict] = {}
+
+    for crs, src in zip(all_crs, source_files):
+        dt = jpg_datetimes.get(src)
+        if not dt:
+            continue
+        cr3_stem = cr3_dt_to_stem.get(dt)
+        if cr3_stem:
+            matched_stems.add(cr3_stem)
+            matched_jpgs.add(src)
+            jpg_by_stem[cr3_stem] = crs
+
+    unmatched_jpg_count = len(source_files) - len(matched_jpgs)
+    unmatched_cr3s = all_cr3_stems - matched_stems
+
+    # Print matching report
+    print(f"\n{'=' * 60}")
+    print("CALIBRATION MATCHING REPORT")
+    print(f"{'=' * 60}")
+    print(f"  Matched pairs:   {len(matched_stems)} (by DateTimeOriginal)")
+    print(f"  Unmatched JPGs:  {unmatched_jpg_count}")
+    print(f"  Unmatched CR3s:  {len(unmatched_cr3s)}")
+    if matched_stems:
+        print(f"\n  Matched CR3 stems: {', '.join(sorted(matched_stems))}")
+    print(f"{'=' * 60}")
+
+    if not matched_stems:
+        print("\nWarning: No JPG-CR3 matches found. Falling back to uniform style.")
+        return {}
+
+    # Build per-CR3 styles for matched CR3s
+    per_cr3_styles: dict[str, dict] = {}
+    for stem in matched_stems:
+        per_cr3_styles[stem] = jpg_by_stem[stem]
+
+    if not unmatched_cr3s:
+        return per_cr3_styles
+
+    # Use already-extracted EXIF for nearest-neighbor (no second scan needed)
+    print("\nComputing nearest neighbors from cached EXIF data...")
+    exif_data = {
+        stem: {k: v for k, v in meta.items() if k != "datetime"}
+        for stem, meta in cr3_metadata.items()
+    }
+
+    # Normalize EXIF features to [0, 1] via min-max
+    features = ["ISO", "ExposureTime", "FNumber", "FocalLength", "Flash"]
+    all_stems_with_exif = set(exif_data.keys())
+
+    # Compute min/max for each feature
+    feat_min = {}
+    feat_max = {}
+    for feat in features:
+        vals = [exif_data[s][feat] for s in all_stems_with_exif if feat in exif_data[s]]
+        if vals:
+            feat_min[feat] = min(vals)
+            feat_max[feat] = max(vals)
+        else:
+            feat_min[feat] = 0
+            feat_max[feat] = 1
+
+    def normalize(stem: str) -> list[float]:
+        """Get normalized feature vector for a CR3."""
+        exif = exif_data.get(stem, {})
+        vec = []
+        for feat in features:
+            val = exif.get(feat, 0)
+            fmin = feat_min[feat]
+            fmax = feat_max[feat]
+            if fmax - fmin > 0:
+                vec.append((val - fmin) / (fmax - fmin))
+            else:
+                vec.append(0.0)
+        return vec
+
+    def euclidean_dist(a: list[float], b: list[float]) -> float:
+        return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+
+    # For each unmatched CR3, find k=5 nearest matched CR3s
+    k = min(5, len(matched_stems))
+    matched_with_exif = [s for s in matched_stems if s in exif_data]
+
+    if not matched_with_exif:
+        print("Warning: No EXIF data for matched CR3s. Unmatched CR3s will use fallback style.")
+        return per_cr3_styles
+
+    matched_vecs = {s: normalize(s) for s in matched_with_exif}
+
+    for stem in tqdm(sorted(unmatched_cr3s), desc="Finding nearest neighbors", unit="file"):
+        if stem not in exif_data:
+            continue
+        target_vec = normalize(stem)
+        # Compute distances to all matched CR3s
+        distances = []
+        for m_stem in matched_with_exif:
+            dist = euclidean_dist(target_vec, matched_vecs[m_stem])
+            distances.append((dist, m_stem))
+        distances.sort(key=lambda x: x[0])
+        neighbors = [m_stem for _, m_stem in distances[:k]]
+        # Merge neighbor CRS settings
+        neighbor_crs = [jpg_by_stem[s] for s in neighbors]
+        per_cr3_styles[stem] = _merge_crs(neighbor_crs)
+
+    return per_cr3_styles
 
 
 def build_xmp_sidecar(style: dict, raw_filename: str) -> str:
@@ -378,25 +685,27 @@ def generate_sidecars(
     cr3_dir: Path,
     skip_existing: bool = False,
     dry_run: bool = False,
+    per_cr3_styles: dict[str, dict] | None = None,
 ) -> dict:
     """
     Write .xmp sidecar files for every CR3 in the directory.
 
     Args:
-        style: Style settings dict
+        style: Fallback style settings dict
         cr3_dir: Directory containing CR3 files
         skip_existing: Skip if .xmp already exists
         dry_run: Print what would be done without writing
+        per_cr3_styles: Optional dict mapping CR3 stem (lowercase) to per-file CRS
 
     Returns:
-        Dict with counts: generated, skipped
+        Dict with counts: generated, skipped, calibrated
     """
     cr3_files = sorted(cr3_dir.glob("*.CR3")) + sorted(cr3_dir.glob("*.cr3"))
     if not cr3_files:
         print(f"No CR3 files found in {cr3_dir}")
-        return {"generated": 0, "skipped": 0}
+        return {"generated": 0, "skipped": 0, "calibrated": 0}
 
-    stats = {"generated": 0, "skipped": 0}
+    stats = {"generated": 0, "skipped": 0, "calibrated": 0}
 
     for cr3_path in tqdm(cr3_files, desc="Generating XMP sidecars", unit="file"):
         xmp_path = cr3_path.with_suffix(".xmp")
@@ -405,11 +714,19 @@ def generate_sidecars(
             stats["skipped"] += 1
             continue
 
+        # Use per-CR3 style if available, otherwise fallback
+        cr3_stem = cr3_path.stem.lower()
+        if per_cr3_styles and cr3_stem in per_cr3_styles:
+            file_style = per_cr3_styles[cr3_stem]
+            stats["calibrated"] += 1
+        else:
+            file_style = style
+
         if dry_run:
             stats["generated"] += 1
             continue
 
-        xmp_content = build_xmp_sidecar(style, cr3_path.name)
+        xmp_content = build_xmp_sidecar(file_style, cr3_path.name)
         xmp_path.write_text(xmp_content, encoding="utf-8")
         stats["generated"] += 1
 
@@ -488,6 +805,11 @@ def main():
         action="store_true",
         help="Skip CR3 files that already have an .xmp sidecar",
     )
+    parser.add_argument(
+        "--calibrate",
+        action="store_true",
+        help="Match JPGs to CR3s by filename; matched get full edit, unmatched get nearest-neighbor style",
+    )
 
     args = parser.parse_args()
 
@@ -495,42 +817,66 @@ def main():
         print(f"Error: JPG directory does not exist: {args.jpg_dir}")
         sys.exit(1)
 
-    # Step 1: Extract CRS from JPGs
-    print("Step 1: Extracting Camera Raw Settings from JPGs...")
-    all_crs = extract_crs_from_jpgs(args.jpg_dir)
+    with exiftool.ExifTool() as et:
+        # Step 1: Extract CRS from JPGs
+        print("Step 1: Extracting Camera Raw Settings from JPGs...")
+        all_crs, source_files = extract_crs_from_jpgs(args.jpg_dir, et)
 
-    if not all_crs:
-        print("No CRS data found in JPGs. Are these Lightroom-exported files?")
-        sys.exit(1)
+        if not all_crs:
+            print("No CRS data found in JPGs. Are these Lightroom-exported files?")
+            sys.exit(1)
 
-    # Step 2: Classify settings
-    print("\nStep 2: Classifying style vs per-image settings...")
-    style, report = classify_settings(all_crs)
+        # Step 2: Calibration mode or uniform style
+        per_cr3_styles = None
 
-    print_analysis_report(style, report)
+        if args.calibrate:
+            if not args.cr3_dir.is_dir():
+                print(f"Error: CR3 directory does not exist: {args.cr3_dir}")
+                sys.exit(1)
 
-    if args.analyze_only:
-        print(f"\n{len(style)} style settings extracted. Use without --analyze-only to generate sidecars.")
-        return
+            print("\nStep 2: Calibrating — matching JPGs to CR3s by timestamp...")
+            per_cr3_styles = match_and_calibrate(all_crs, source_files, args.cr3_dir)
 
-    # Step 3: Generate sidecars
-    if not args.cr3_dir.is_dir():
-        print(f"Error: CR3 directory does not exist: {args.cr3_dir}")
-        sys.exit(1)
+            # Classify the matched subset for analysis report and fallback style
+            matched_crs = [crs for crs, src in zip(all_crs, source_files)
+                           if Path(src).stem.lower() in per_cr3_styles]
+            crs_for_classify = matched_crs if matched_crs else all_crs
 
-    action = "Would generate" if args.dry_run else "Generating"
-    print(f"\nStep 3: {action} XMP sidecars in {args.cr3_dir}...")
+            print("\nStep 2b: Classifying style from matched images (for analysis & fallback)...")
+            style, report = classify_settings(crs_for_classify)
+            print_analysis_report(style, report)
+        else:
+            print("\nStep 2: Classifying style vs per-image settings...")
+            style, report = classify_settings(all_crs)
+            print_analysis_report(style, report)
 
-    stats = generate_sidecars(
-        style=style,
-        cr3_dir=args.cr3_dir,
-        skip_existing=args.skip_existing,
-        dry_run=args.dry_run,
-    )
+        if args.analyze_only:
+            print(f"\n{len(style)} style settings extracted. Use without --analyze-only to generate sidecars.")
+            if per_cr3_styles:
+                print(f"Calibration: {len(per_cr3_styles)} CR3s have per-file styles.")
+            return
 
-    print(f"\nDone! Generated: {stats['generated']}, Skipped: {stats['skipped']}")
-    if args.dry_run:
-        print("(Dry run — no files were written)")
+        # Step 3: Generate sidecars
+        if not args.cr3_dir.is_dir():
+            print(f"Error: CR3 directory does not exist: {args.cr3_dir}")
+            sys.exit(1)
+
+        action = "Would generate" if args.dry_run else "Generating"
+        print(f"\nStep 3: {action} XMP sidecars in {args.cr3_dir}...")
+
+        stats = generate_sidecars(
+            style=style,
+            cr3_dir=args.cr3_dir,
+            skip_existing=args.skip_existing,
+            dry_run=args.dry_run,
+            per_cr3_styles=per_cr3_styles,
+        )
+
+        print(f"\nDone! Generated: {stats['generated']}, Skipped: {stats['skipped']}")
+        if per_cr3_styles:
+            print(f"Calibrated: {stats['calibrated']} CR3s received per-file styles")
+        if args.dry_run:
+            print("(Dry run — no files were written)")
 
 
 if __name__ == "__main__":

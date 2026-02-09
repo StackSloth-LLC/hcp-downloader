@@ -5,6 +5,7 @@ description = "Download photos from a Synology NAS through the gofile sharing in
 requires-python = ">=3.11"
 dependencies = [
     "playwright>=1.40.0",
+    "pyexiftool>=0.5.0",
     "requests>=2.31.0",
     "tqdm>=4.66.0",
 ]
